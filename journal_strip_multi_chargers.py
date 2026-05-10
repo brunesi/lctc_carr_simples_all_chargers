@@ -27,6 +27,10 @@ SSH behavior follows the working pattern from themall6_Claude.py:
 Progress behavior:
   - --since and --until limit the journalctl time window.
   - --progress streams stdout and periodically reports raw/matching line counts.
+
+Parallel behavior:
+  - By default, all chargers from carregadores.dsv are processed in parallel.
+  - --max-parallel can limit concurrent SSH connections when desired.
 """
 
 from __future__ import annotations
@@ -73,6 +77,27 @@ class JournalReadStats:
     elapsed_s: float = 0.0
 
 
+def validate_unique_custom_ids(chargers: list[Charger]) -> None:
+    """
+    Refuse duplicate custom_id values to avoid output file collisions.
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+
+    for charger in chargers:
+        if charger.custom_id in seen:
+            duplicates.add(charger.custom_id)
+        seen.add(charger.custom_id)
+
+    if duplicates:
+        duplicate_list = ", ".join(sorted(duplicates))
+        raise ValueError(
+            "Duplicate custom_id value(s) in charger list: "
+            f"{duplicate_list}. Each custom_id must be unique because it is "
+            "used as the output filename prefix."
+        )
+
+
 def load_chargers(path: Path) -> list[Charger]:
     """Load chargers from a CSV/DSV-like file with columns custom_id, ip."""
     if not path.exists():
@@ -110,8 +135,8 @@ def load_chargers(path: Path) -> list[Charger]:
             )
             continue
 
-        custom_id = row[0].strip().strip('"').strip("'")
-        ip = row[1].strip().strip('"').strip("'")
+        custom_id = row[0].strip().strip('\"').strip("'")
+        ip = row[1].strip().strip('\"').strip("'")
 
         if not custom_id or not ip:
             print(f"Skipping invalid row {line_number}: empty custom_id or ip", file=sys.stderr)
@@ -122,6 +147,7 @@ def load_chargers(path: Path) -> list[Charger]:
     if not chargers:
         raise ValueError(f"No valid chargers found in charger list file: {path}")
 
+    validate_unique_custom_ids(chargers)
     return chargers
 
 
@@ -461,6 +487,31 @@ async def process_charger(
     process_lines(lines, prefix=charger.custom_id)
 
 
+async def process_charger_with_limit(
+    semaphore: asyncio.Semaphore,
+    index: int,
+    total: int,
+    charger: Charger,
+    args: argparse.Namespace,
+) -> None:
+    """Run one charger task while respecting the max-parallel semaphore."""
+    async with semaphore:
+        await process_charger(
+            index=index,
+            total=total,
+            charger=charger,
+            ssh_user=args.ssh_user,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            connect_timeout=args.connect_timeout,
+            command_timeout=args.command_timeout,
+            since=args.since,
+            until=args.until,
+            progress=args.progress,
+            progress_interval_s=args.progress_interval,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -503,12 +554,30 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=0,
+        help=(
+            "Maximum simultaneous SSH collections. "
+            "Use 0 to process all chargers in parallel. Default: 0."
+        ),
+    )
+
+    parser.add_argument(
         "--local",
         action="store_true",
         help="Run only against the local machine. In this mode carregadores.dsv is not used.",
     )
 
     return parser.parse_args()
+
+
+def resolve_max_parallel(requested: int, charger_count: int) -> int:
+    """Convert --max-parallel into an effective concurrency value."""
+    if requested <= 0:
+        return charger_count
+
+    return min(requested, charger_count)
 
 
 async def async_main() -> None:
@@ -534,28 +603,29 @@ async def async_main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    max_parallel = resolve_max_parallel(args.max_parallel, len(chargers))
+    semaphore = asyncio.Semaphore(max_parallel)
+
     print(f"Loaded {len(chargers)} charger(s) from {chargers_path}")
     print(f"Using SSH key: {args.ssh_key}")
     print(f"Using SSH user/port: {args.ssh_user}/{args.ssh_port}")
+    print(f"Using max parallel SSH collections: {max_parallel}")
 
     if args.since or args.until:
         print(f"Using journal window: since={args.since or '-'} until={args.until or '-'}")
 
-    for index, charger in enumerate(chargers, start=1):
-        await process_charger(
-            index=index,
-            total=len(chargers),
-            charger=charger,
-            ssh_user=args.ssh_user,
-            ssh_port=args.ssh_port,
-            ssh_key=args.ssh_key,
-            connect_timeout=args.connect_timeout,
-            command_timeout=args.command_timeout,
-            since=args.since,
-            until=args.until,
-            progress=args.progress,
-            progress_interval_s=args.progress_interval,
+    await asyncio.gather(
+        *(
+            process_charger_with_limit(
+                semaphore=semaphore,
+                index=index,
+                total=len(chargers),
+                charger=charger,
+                args=args,
+            )
+            for index, charger in enumerate(chargers, start=1)
         )
+    )
 
     print("\nDone.")
 
