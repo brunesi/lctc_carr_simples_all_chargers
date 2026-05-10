@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-journal_strip.py
+journal_strip_multi_chargers.py
 
 Reads chargepoint.service journal entries filtered by the pattern
 '04 64 <byte>' (excluding 10, 11, e1), then:
@@ -10,7 +10,7 @@ Reads chargepoint.service journal entries filtered by the pattern
      <custom_id>_<start>_<end>_chademo.log
      <custom_id>_<start>_<end>_ccs.log
 
-New multi-charger behavior:
+Multi-charger behavior:
   - Looks for carregadores.dsv in the current directory.
   - Expected format:
         custom_id, ip
@@ -20,10 +20,12 @@ New multi-charger behavior:
   - For each charger, the script connects through SSH and runs:
         journalctl -u chargepoint.service
 
-Assumptions:
-  - SSH key pairs are already correctly configured locally and remotely.
-  - The remote SSH user is 'admin' by default.
-  - The SSH port is 22 by default.
+SSH behavior follows the working pattern from themall6_Claude.py:
+  - asyncssh
+  - default user: admin
+  - default port: 5022
+  - default key: ~/.ssh/id_ed25519_cp
+  - known_hosts=None
 
 Datetime format in filenames: 2026-05-06_14-49-36
   - Source: field 29 (1-indexed) of each filtered line
@@ -33,6 +35,7 @@ Datetime format in filenames: 2026-05-06_14-49-36
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import re
 import subprocess
@@ -41,6 +44,11 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import asyncssh  # type: ignore
+except ImportError:  # pragma: no cover - user-facing dependency check
+    asyncssh = None  # type: ignore
+
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -48,7 +56,8 @@ from pathlib import Path
 
 CHARGERS_FILE = "carregadores.dsv"
 DEFAULT_SSH_USER = "admin"
-DEFAULT_SSH_PORT = 22
+DEFAULT_SSH_PORT = 5022
+DEFAULT_SSH_KEY = Path.home() / ".ssh" / "id_ed25519_cp"
 
 GREP_PATTERN = re.compile(r"04 64 (?!10|11|e1)[0-9a-f]{2}.*")
 
@@ -114,7 +123,10 @@ def load_chargers(path: Path) -> list[Charger]:
 
     for line_number, row in enumerate(data_rows, start=2 if has_header else 1):
         if len(row) < 2:
-            print(f"Skipping invalid row {line_number}: expected 2 columns, got {len(row)}", file=sys.stderr)
+            print(
+                f"Skipping invalid row {line_number}: expected 2 columns, got {len(row)}",
+                file=sys.stderr,
+            )
             continue
 
         custom_id = row[0].strip().strip('"').strip("'")
@@ -172,38 +184,69 @@ def run_local_journal() -> list[str]:
     return filter_journal_output(result.stdout)
 
 
-def run_remote_journal(charger: Charger, ssh_user: str, ssh_port: int, timeout: int) -> list[str]:
+async def run_remote_journal(
+    charger: Charger,
+    ssh_user: str,
+    ssh_port: int,
+    ssh_key: Path,
+    connect_timeout: int,
+    command_timeout: int,
+) -> list[str]:
     """
-    Run journalctl remotely over SSH and return filtered lines.
+    Run journalctl remotely over SSH using asyncssh and return filtered lines.
 
-    BatchMode=yes prevents SSH from hanging waiting for a password if key auth fails.
+    This intentionally mirrors themall6_Claude.py:
+    - explicit client key
+    - known_hosts=None
+    - no dependency on ssh-agent behavior
     """
-    ssh_target = f"{ssh_user}@{charger.ip}"
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        "-p", str(ssh_port),
-        ssh_target,
-        "journalctl -u chargepoint.service",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+    if asyncssh is None:
+        print(
+            "Missing dependency: asyncssh. Install it with: python3 -m pip install asyncssh",
+            file=sys.stderr,
         )
-    except subprocess.TimeoutExpired:
-        print(f"[{charger.custom_id}] SSH/journal timeout after {timeout}s", file=sys.stderr)
         return []
 
-    if result.returncode != 0:
+    if not ssh_key.exists():
+        print(f"[{charger.custom_id}] SSH key not found: {ssh_key}", file=sys.stderr)
+        return []
+
+    try:
+        conn = await asyncssh.connect(
+            charger.ip,
+            port=ssh_port,
+            username=ssh_user,
+            client_keys=[str(ssh_key)],
+            known_hosts=None,
+            connect_timeout=connect_timeout,
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                conn.run("journalctl -u chargepoint.service", check=False),
+                timeout=command_timeout,
+            )
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    except asyncio.TimeoutError:
         print(
-            f"[{charger.custom_id}] SSH/journal command failed "
-            f"(return code {result.returncode})\n"
-            f"stderr: {result.stderr.strip()}",
+            f"[{charger.custom_id}] SSH/journal timeout after {command_timeout}s",
+            file=sys.stderr,
+        )
+        return []
+
+    except (asyncssh.Error, OSError) as exc:  # type: ignore[union-attr]
+        print(f"[{charger.custom_id}] SSH connection failed: {exc}", file=sys.stderr)
+        return []
+
+    if result.exit_status != 0:
+        error_text = result.stderr.strip() or result.stdout.strip()
+        print(
+            f"[{charger.custom_id}] journal command failed "
+            f"(exit status {result.exit_status})\n"
+            f"stderr/stdout: {error_text}",
             file=sys.stderr,
         )
         return []
@@ -293,38 +336,31 @@ def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
             new_type = START_BYTES[byte]
 
             if current_session is None:
-                # First session ever
                 current_session = new_type
                 current_lines = [line]
                 current_start_dt = dt
 
             elif new_type != current_session:
-                # Transition to the other session type
                 close_current()
                 current_session = new_type
                 current_lines = [line]
                 current_start_dt = dt
 
             else:
-                # Same type: new session only if previous ended with its end byte
                 if last_byte == END_BYTES[current_session]:
                     close_current()
                     current_session = new_type
                     current_lines = [line]
                     current_start_dt = dt
                 else:
-                    # Still within the same session
                     current_lines.append(line)
 
         else:
             if current_session is not None:
                 current_lines.append(line)
-            # Lines outside any session are not written to session files
-            # but are still present in the full journal file.
 
         last_byte = byte
 
-    # Close the last open session
     if current_session and current_lines:
         close_current()
 
@@ -336,20 +372,16 @@ def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
 # --------------------------------------------------------------------------- #
 
 def process_lines(lines: list[str], prefix: str = "") -> None:
-    """
-    Save full journal and detected session files for one charger/source.
-    """
+    """Save full journal and detected session files for one charger/source."""
     if not lines:
         print("  No matching lines found.")
         return
 
     print(f"  Total matching lines: {len(lines)}")
 
-    # --- Full journal file ---
     print("  Writing full journal file:")
     save_file(lines, get_dt(lines[0]), get_dt(lines[-1]), "journal", prefix=prefix)
 
-    # --- Session files ---
     sessions = detect_sessions(lines)
     print(f"  Detected {len(sessions)} charging session(s):")
 
@@ -357,9 +389,23 @@ def process_lines(lines: list[str], prefix: str = "") -> None:
         save_file(session_lines, start_dt, end_dt, session_type, prefix=prefix)
 
 
-def process_charger(charger: Charger, ssh_user: str, ssh_port: int, timeout: int) -> None:
-    print(f"\n[{charger.custom_id}] Reading journal from {charger.ip}...")
-    lines = run_remote_journal(charger, ssh_user=ssh_user, ssh_port=ssh_port, timeout=timeout)
+async def process_charger(
+    charger: Charger,
+    ssh_user: str,
+    ssh_port: int,
+    ssh_key: Path,
+    connect_timeout: int,
+    command_timeout: int,
+) -> None:
+    print(f"\n[{charger.custom_id}] Reading journal from {charger.ip}:{ssh_port}...")
+    lines = await run_remote_journal(
+        charger,
+        ssh_user=ssh_user,
+        ssh_port=ssh_port,
+        ssh_key=ssh_key,
+        connect_timeout=connect_timeout,
+        command_timeout=command_timeout,
+    )
     process_lines(lines, prefix=charger.custom_id)
 
 
@@ -395,10 +441,24 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--timeout",
+        "--ssh-key",
+        type=Path,
+        default=DEFAULT_SSH_KEY,
+        help=f"SSH private key path. Default: {DEFAULT_SSH_KEY}",
+    )
+
+    parser.add_argument(
+        "--connect-timeout",
+        type=int,
+        default=3,
+        help="SSH connection timeout in seconds. Default: 3",
+    )
+
+    parser.add_argument(
+        "--command-timeout",
         type=int,
         default=180,
-        help="Timeout in seconds for each remote journal command. Default: 180",
+        help="Remote journal command timeout in seconds. Default: 180",
     )
 
     parser.add_argument(
@@ -413,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+async def async_main() -> None:
     args = parse_args()
 
     if args.local:
@@ -432,16 +492,24 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Loaded {len(chargers)} charger(s) from {chargers_path}")
+    print(f"Using SSH key: {args.ssh_key}")
+    print(f"Using SSH user/port: {args.ssh_user}/{args.ssh_port}")
 
     for charger in chargers:
-        process_charger(
+        await process_charger(
             charger,
             ssh_user=args.ssh_user,
             ssh_port=args.ssh_port,
-            timeout=args.timeout,
+            ssh_key=args.ssh_key,
+            connect_timeout=args.connect_timeout,
+            command_timeout=args.command_timeout,
         )
 
     print("\nDone.")
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
