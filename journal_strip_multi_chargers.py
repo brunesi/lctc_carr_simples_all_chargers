@@ -24,13 +24,13 @@ SSH behavior follows the working pattern from themall6_Claude.py:
   - default key: ~/.ssh/id_ed25519_cp
   - known_hosts=None
 
-Progress behavior:
+Progress/log/UI behavior:
   - --since and --until limit the journalctl time window.
   - --progress streams stdout and periodically reports raw/matching line counts.
-
-Parallel behavior:
-  - By default, all chargers from carregadores.dsv are processed in parallel.
-  - --max-parallel can limit concurrent SSH connections when desired.
+  - A timestamped log file is created by default:
+        yyyy-mm-dd_hh-mm-ss_journal-split-multi.log
+  - --textual opens a Textual table with one progress/status row per charger.
+  - --no-log disables the log file.
 """
 
 from __future__ import annotations
@@ -45,12 +45,24 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 try:
     import asyncssh  # type: ignore
 except ImportError:
     asyncssh = None  # type: ignore
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.widgets import DataTable, Footer, Static
+except ImportError:
+    App = None  # type: ignore
+    ComposeResult = Any  # type: ignore
+    DataTable = None  # type: ignore
+    Footer = None  # type: ignore
+    Static = None  # type: ignore
 
 
 CHARGERS_FILE = "carregadores.dsv"
@@ -77,10 +89,138 @@ class JournalReadStats:
     elapsed_s: float = 0.0
 
 
+@dataclass(frozen=True)
+class ChargerEvent:
+    custom_id: str
+    ip: str
+    status: str
+    raw_lines: int = 0
+    matching_lines: int = 0
+    sessions: int = 0
+    files: int = 0
+    elapsed_s: float = 0.0
+    message: str = ""
+
+
+@dataclass
+class ProcessResult:
+    raw_lines: int = 0
+    matching_lines: int = 0
+    sessions: int = 0
+    files: int = 0
+    elapsed_s: float = 0.0
+    ok: bool = True
+    message: str = ""
+
+
+class EventLogger:
+    """Small timestamped text logger used by both plain and Textual modes."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._handle = None
+
+        if self.path is not None:
+            self._handle = self.path.open("a", encoding="utf-8")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    def write(self, text: str) -> None:
+        if self._handle is None:
+            return
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._handle.write(f"{stamp} {text}\n")
+        self._handle.flush()
+
+    def event(self, event: ChargerEvent) -> None:
+        self.write(
+            f"[{event.custom_id}] status={event.status} ip={event.ip} "
+            f"raw={event.raw_lines} matching={event.matching_lines} "
+            f"sessions={event.sessions} files={event.files} "
+            f"elapsed={format_elapsed(event.elapsed_s)} message={event.message}"
+        )
+
+
+class EventHub:
+    """Dispatches events to log file, console and optional Textual queue."""
+
+    def __init__(
+        self,
+        logger: EventLogger,
+        *,
+        console: bool,
+        progress: bool,
+        queue: asyncio.Queue[ChargerEvent] | None = None,
+    ) -> None:
+        self.logger = logger
+        self.console = console
+        self.progress = progress
+        self.queue = queue
+
+    async def emit(self, event: ChargerEvent) -> None:
+        self.logger.event(event)
+
+        if self.queue is not None:
+            await self.queue.put(event)
+
+        if self.console:
+            self._print_event(event)
+
+    def _print_event(self, event: ChargerEvent) -> None:
+        if event.status == "reading" and self.progress:
+            print(
+                f"[{event.custom_id}] raw={event.raw_lines} "
+                f"matching={event.matching_lines} "
+                f"elapsed={format_elapsed(event.elapsed_s)}",
+                flush=True,
+            )
+            return
+
+        if event.status == "connecting":
+            print(f"\n[{event.custom_id}] Connecting to {event.ip}...", flush=True)
+            return
+
+        if event.status == "command":
+            print(f"[{event.custom_id}] Running: {event.message}", flush=True)
+            return
+
+        if event.status == "processing":
+            print(f"[{event.custom_id}] Processing...", flush=True)
+            return
+
+        if event.status == "saving":
+            print(f"[{event.custom_id}] {event.message}", flush=True)
+            return
+
+        if event.status == "done":
+            print(
+                f"[{event.custom_id}] Done. raw={event.raw_lines} "
+                f"matching={event.matching_lines} sessions={event.sessions} "
+                f"files={event.files} elapsed={format_elapsed(event.elapsed_s)}",
+                flush=True,
+            )
+            return
+
+        if event.status == "failed":
+            print(f"[{event.custom_id}] FAILED: {event.message}", file=sys.stderr, flush=True)
+            return
+
+        if event.message:
+            print(f"[{event.custom_id}] {event.status}: {event.message}", flush=True)
+
+
+def make_default_log_path() -> Path:
+    """Return yyyy-mm-dd_hh-mm-ss_journal-split-multi.log."""
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return Path(f"{stamp}_journal-split-multi.log")
+
+
 def validate_unique_custom_ids(chargers: list[Charger]) -> None:
-    """
-    Refuse duplicate custom_id values to avoid output file collisions.
-    """
+    """Refuse duplicate custom_id values to avoid output file collisions."""
     seen: set[str] = set()
     duplicates: set[str] = set()
 
@@ -135,8 +275,8 @@ def load_chargers(path: Path) -> list[Charger]:
             )
             continue
 
-        custom_id = row[0].strip().strip('\"').strip("'")
-        ip = row[1].strip().strip('\"').strip("'")
+        custom_id = row[0].strip().strip('"').strip("'")
+        ip = row[1].strip().strip('"').strip("'")
 
         if not custom_id or not ip:
             print(f"Skipping invalid row {line_number}: empty custom_id or ip", file=sys.stderr)
@@ -181,28 +321,6 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def maybe_print_progress(
-    label: str,
-    stats: JournalReadStats,
-    last_print_time: float,
-    interval_s: float,
-    force: bool = False,
-) -> float:
-    """Print progress periodically and return the updated last_print_time."""
-    now = time.monotonic()
-
-    if not force and (now - last_print_time) < interval_s:
-        return last_print_time
-
-    print(
-        f"[{label}] raw={stats.raw_lines} "
-        f"matching={stats.matching_lines} "
-        f"elapsed={format_elapsed(stats.elapsed_s)}",
-        flush=True,
-    )
-    return now
-
-
 def filter_one_journal_line(raw: str) -> str | None:
     """Return the matching payload portion of a journal line, or None."""
     m = GREP_PATTERN.search(raw)
@@ -230,56 +348,44 @@ def run_local_journal(since: str | None = None, until: str | None = None) -> lis
 
 async def run_remote_journal(
     charger: Charger,
-    ssh_user: str,
-    ssh_port: int,
-    ssh_key: Path,
-    connect_timeout: int,
-    command_timeout: int,
-    since: str | None,
-    until: str | None,
-    progress: bool,
-    progress_interval_s: float,
-) -> list[str]:
-    """
-    Run journalctl remotely over SSH using asyncssh and return filtered lines.
-
-    With --progress, stdout is streamed and raw/matching line counters are printed.
-    """
-    if asyncssh is None:
-        print(
-            "Missing dependency: asyncssh. Install it with: python3 -m pip install asyncssh",
-            file=sys.stderr,
-        )
-        return []
-
-    if not ssh_key.exists():
-        print(f"[{charger.custom_id}] SSH key not found: {ssh_key}", file=sys.stderr)
-        return []
-
-    command = build_journalctl_command(since=since, until=until)
-    lines: list[str] = []
+    args: argparse.Namespace,
+    hub: EventHub,
+) -> tuple[list[str], JournalReadStats, bool, str]:
+    """Run journalctl remotely over SSH using asyncssh and return filtered lines."""
     stats = JournalReadStats()
+    lines: list[str] = []
     start_time = time.monotonic()
-    last_print_time = start_time
+    last_progress_time = start_time
+
+    if asyncssh is None:
+        message = "Missing dependency: asyncssh. Install it with: python3 -m pip install asyncssh"
+        await hub.emit(ChargerEvent(charger.custom_id, charger.ip, "failed", message=message))
+        return lines, stats, False, message
+
+    if not args.ssh_key.exists():
+        message = f"SSH key not found: {args.ssh_key}"
+        await hub.emit(ChargerEvent(charger.custom_id, charger.ip, "failed", message=message))
+        return lines, stats, False, message
+
+    command = build_journalctl_command(since=args.since, until=args.until)
+
+    await hub.emit(ChargerEvent(charger.custom_id, charger.ip, "command", message=command))
 
     try:
         conn = await asyncssh.connect(
             charger.ip,
-            port=ssh_port,
-            username=ssh_user,
-            client_keys=[str(ssh_key)],
+            port=args.ssh_port,
+            username=args.ssh_user,
+            client_keys=[str(args.ssh_key)],
             known_hosts=None,
-            connect_timeout=connect_timeout,
+            connect_timeout=args.connect_timeout,
         )
 
         try:
-            if progress:
-                print(f"[{charger.custom_id}] Running: {command}", flush=True)
-
             process = await conn.create_process(command)
 
             async def consume_stdout() -> None:
-                nonlocal last_print_time
+                nonlocal last_progress_time
 
                 async for raw_line in process.stdout:
                     stats.raw_lines += 1
@@ -290,16 +396,22 @@ async def run_remote_journal(
                         stats.matching_lines += 1
 
                     stats.elapsed_s = time.monotonic() - start_time
+                    now = time.monotonic()
 
-                    if progress:
-                        last_print_time = maybe_print_progress(
-                            charger.custom_id,
-                            stats,
-                            last_print_time,
-                            progress_interval_s,
+                    if args.progress and (now - last_progress_time) >= args.progress_interval:
+                        last_progress_time = now
+                        await hub.emit(
+                            ChargerEvent(
+                                charger.custom_id,
+                                charger.ip,
+                                "reading",
+                                raw_lines=stats.raw_lines,
+                                matching_lines=stats.matching_lines,
+                                elapsed_s=stats.elapsed_s,
+                            )
                         )
 
-            await asyncio.wait_for(consume_stdout(), timeout=command_timeout)
+            await asyncio.wait_for(consume_stdout(), timeout=args.command_timeout)
             await asyncio.wait_for(process.wait(), timeout=10)
 
             if process.exit_status != 0:
@@ -308,41 +420,69 @@ async def run_remote_journal(
                 if process.stderr is not None:
                     stderr = await process.stderr.read()
 
-                print(
-                    f"[{charger.custom_id}] journal command failed "
-                    f"(exit status {process.exit_status})\n"
-                    f"stderr: {stderr.strip()}",
-                    file=sys.stderr,
+                message = f"journal command failed, exit={process.exit_status}: {stderr.strip()}"
+                await hub.emit(
+                    ChargerEvent(
+                        charger.custom_id,
+                        charger.ip,
+                        "failed",
+                        raw_lines=stats.raw_lines,
+                        matching_lines=stats.matching_lines,
+                        elapsed_s=stats.elapsed_s,
+                        message=message,
+                    )
                 )
-                return []
+                return lines, stats, False, message
 
         finally:
             conn.close()
             await conn.wait_closed()
 
     except asyncio.TimeoutError:
-        print(
-            f"[{charger.custom_id}] SSH/journal timeout after {command_timeout}s",
-            file=sys.stderr,
+        message = f"SSH/journal timeout after {args.command_timeout}s"
+        await hub.emit(
+            ChargerEvent(
+                charger.custom_id,
+                charger.ip,
+                "failed",
+                raw_lines=stats.raw_lines,
+                matching_lines=stats.matching_lines,
+                elapsed_s=stats.elapsed_s,
+                message=message,
+            )
         )
-        return []
+        return lines, stats, False, message
 
     except (asyncssh.Error, OSError) as exc:  # type: ignore[union-attr]
-        print(f"[{charger.custom_id}] SSH connection failed: {exc}", file=sys.stderr)
-        return []
+        message = f"SSH connection failed: {exc}"
+        await hub.emit(
+            ChargerEvent(
+                charger.custom_id,
+                charger.ip,
+                "failed",
+                raw_lines=stats.raw_lines,
+                matching_lines=stats.matching_lines,
+                elapsed_s=stats.elapsed_s,
+                message=message,
+            )
+        )
+        return lines, stats, False, message
 
     stats.elapsed_s = time.monotonic() - start_time
 
-    if progress:
-        maybe_print_progress(
-            charger.custom_id,
-            stats,
-            last_print_time,
-            progress_interval_s,
-            force=True,
+    if args.progress:
+        await hub.emit(
+            ChargerEvent(
+                charger.custom_id,
+                charger.ip,
+                "reading",
+                raw_lines=stats.raw_lines,
+                matching_lines=stats.matching_lines,
+                elapsed_s=stats.elapsed_s,
+            )
         )
 
-    return lines
+    return lines, stats, True, ""
 
 
 def get_dt(line: str) -> str:
@@ -362,8 +502,8 @@ def get_byte(line: str) -> str | None:
     return fields[2] if len(fields) > 2 else None
 
 
-def save_file(lines: list[str], start_dt: str, end_dt: str, suffix: str, prefix: str = "") -> None:
-    """Save lines to a log file."""
+def save_file(lines: list[str], start_dt: str, end_dt: str, suffix: str, prefix: str = "") -> str:
+    """Save lines to a log file and return the filename."""
     clean_prefix = safe_filename_part(prefix) if prefix else ""
 
     if clean_prefix:
@@ -372,7 +512,7 @@ def save_file(lines: list[str], start_dt: str, end_dt: str, suffix: str, prefix:
         filename = f"{start_dt}_{end_dt}_{suffix}.log"
 
     Path(filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"  Saved: {filename}  ({len(lines)} lines)")
+    return filename
 
 
 def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
@@ -429,62 +569,137 @@ def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
     return sessions
 
 
-def process_lines(lines: list[str], prefix: str = "") -> None:
+async def process_lines(
+    lines: list[str],
+    prefix: str,
+    charger: Charger,
+    hub: EventHub,
+    stats: JournalReadStats,
+) -> ProcessResult:
     """Save full journal and detected session files for one charger/source."""
     if not lines:
-        print("  No matching lines found.")
-        return
+        message = "No matching lines found."
+        await hub.emit(
+            ChargerEvent(
+                charger.custom_id,
+                charger.ip,
+                "done",
+                raw_lines=stats.raw_lines,
+                matching_lines=stats.matching_lines,
+                elapsed_s=stats.elapsed_s,
+                message=message,
+            )
+        )
+        return ProcessResult(
+            raw_lines=stats.raw_lines,
+            matching_lines=stats.matching_lines,
+            elapsed_s=stats.elapsed_s,
+            ok=True,
+            message=message,
+        )
 
-    print(f"  Total matching lines: {len(lines)}")
-
-    print("  Writing full journal file:")
-    save_file(lines, get_dt(lines[0]), get_dt(lines[-1]), "journal", prefix=prefix)
-
+    files = 0
     sessions = detect_sessions(lines)
-    print(f"  Detected {len(sessions)} charging session(s):")
+
+    filename = save_file(lines, get_dt(lines[0]), get_dt(lines[-1]), "journal", prefix=prefix)
+    files += 1
+    await hub.emit(
+        ChargerEvent(
+            charger.custom_id,
+            charger.ip,
+            "saving",
+            raw_lines=stats.raw_lines,
+            matching_lines=stats.matching_lines,
+            sessions=len(sessions),
+            files=files,
+            elapsed_s=stats.elapsed_s,
+            message=f"Saved: {filename} ({len(lines)} lines)",
+        )
+    )
 
     for session_type, start_dt, end_dt, session_lines in sessions:
-        save_file(session_lines, start_dt, end_dt, session_type, prefix=prefix)
+        filename = save_file(session_lines, start_dt, end_dt, session_type, prefix=prefix)
+        files += 1
+        await hub.emit(
+            ChargerEvent(
+                charger.custom_id,
+                charger.ip,
+                "saving",
+                raw_lines=stats.raw_lines,
+                matching_lines=stats.matching_lines,
+                sessions=len(sessions),
+                files=files,
+                elapsed_s=stats.elapsed_s,
+                message=f"Saved: {filename} ({len(session_lines)} lines)",
+            )
+        )
+
+    message = f"Saved {files} file(s)."
+    await hub.emit(
+        ChargerEvent(
+            charger.custom_id,
+            charger.ip,
+            "done",
+            raw_lines=stats.raw_lines,
+            matching_lines=stats.matching_lines,
+            sessions=len(sessions),
+            files=files,
+            elapsed_s=stats.elapsed_s,
+            message=message,
+        )
+    )
+
+    return ProcessResult(
+        raw_lines=stats.raw_lines,
+        matching_lines=stats.matching_lines,
+        sessions=len(sessions),
+        files=files,
+        elapsed_s=stats.elapsed_s,
+        ok=True,
+        message=message,
+    )
 
 
 async def process_charger(
     index: int,
     total: int,
     charger: Charger,
-    ssh_user: str,
-    ssh_port: int,
-    ssh_key: Path,
-    connect_timeout: int,
-    command_timeout: int,
-    since: str | None,
-    until: str | None,
-    progress: bool,
-    progress_interval_s: float,
-) -> None:
+    args: argparse.Namespace,
+    hub: EventHub,
+) -> ProcessResult:
     """Collect and process one charger."""
-    print(f"\n[{index}/{total}] {charger.custom_id}  Connecting to {charger.ip}:{ssh_port}...")
-
-    if since or until:
-        print(
-            f"[{index}/{total}] {charger.custom_id}  "
-            f"Journal window: since={since or '-'} until={until or '-'}"
+    await hub.emit(
+        ChargerEvent(
+            charger.custom_id,
+            charger.ip,
+            "connecting",
+            message=f"{index}/{total} {charger.ip}:{args.ssh_port}",
         )
-
-    lines = await run_remote_journal(
-        charger,
-        ssh_user=ssh_user,
-        ssh_port=ssh_port,
-        ssh_key=ssh_key,
-        connect_timeout=connect_timeout,
-        command_timeout=command_timeout,
-        since=since,
-        until=until,
-        progress=progress,
-        progress_interval_s=progress_interval_s,
     )
 
-    print(f"[{index}/{total}] {charger.custom_id}  Processing...")
-    process_lines(lines, prefix=charger.custom_id)
+    lines, stats, ok, message = await run_remote_journal(charger, args, hub)
+
+    if not ok:
+        return ProcessResult(
+            raw_lines=stats.raw_lines,
+            matching_lines=stats.matching_lines,
+            elapsed_s=stats.elapsed_s,
+            ok=False,
+            message=message,
+        )
+
+    await hub.emit(
+        ChargerEvent(
+            charger.custom_id,
+            charger.ip,
+            "processing",
+            raw_lines=stats.raw_lines,
+            matching_lines=stats.matching_lines,
+            elapsed_s=stats.elapsed_s,
+        )
+    )
+
+    return await process_lines(lines, charger.custom_id, charger, hub, stats)
 
 
 async def process_charger_with_limit(
@@ -493,22 +708,16 @@ async def process_charger_with_limit(
     total: int,
     charger: Charger,
     args: argparse.Namespace,
-) -> None:
+    hub: EventHub,
+) -> ProcessResult:
     """Run one charger task while respecting the max-parallel semaphore."""
     async with semaphore:
-        await process_charger(
+        return await process_charger(
             index=index,
             total=total,
             charger=charger,
-            ssh_user=args.ssh_user,
-            ssh_port=args.ssh_port,
-            ssh_key=args.ssh_key,
-            connect_timeout=args.connect_timeout,
-            command_timeout=args.command_timeout,
-            since=args.since,
-            until=args.until,
-            progress=args.progress,
-            progress_interval_s=args.progress_interval,
+            args=args,
+            hub=hub,
         )
 
 
@@ -564,6 +773,25 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--textual",
+        action="store_true",
+        help="Show a Textual table with one status/progress row per charger.",
+    )
+
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional log file path. Default: timestamped *_journal-split-multi.log.",
+    )
+
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable timestamped log file creation.",
+    )
+
+    parser.add_argument(
         "--local",
         action="store_true",
         help="Run only against the local machine. In this mode carregadores.dsv is not used.",
@@ -580,41 +808,29 @@ def resolve_max_parallel(requested: int, charger_count: int) -> int:
     return min(requested, charger_count)
 
 
-async def async_main() -> None:
-    """Async entry point."""
-    args = parse_args()
+def make_logger(args: argparse.Namespace) -> EventLogger:
+    """Create the logger according to CLI options."""
+    if args.no_log:
+        return EventLogger(None)
 
-    if args.local:
-        print("Reading local journal (this may take a moment)...")
+    return EventLogger(args.log_file or make_default_log_path())
 
-        if args.since or args.until:
-            print(f"Journal window: since={args.since or '-'} until={args.until or '-'}")
 
-        lines = run_local_journal(since=args.since, until=args.until)
-        process_lines(lines)
-        print("\nDone.")
-        return
-
-    chargers_path = Path(args.chargers_file)
-
-    try:
-        chargers = load_chargers(chargers_path)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
+async def run_collection(
+    chargers: list[Charger],
+    args: argparse.Namespace,
+    hub: EventHub,
+) -> list[ProcessResult]:
+    """Run all charger tasks with the configured concurrency."""
     max_parallel = resolve_max_parallel(args.max_parallel, len(chargers))
     semaphore = asyncio.Semaphore(max_parallel)
 
-    print(f"Loaded {len(chargers)} charger(s) from {chargers_path}")
-    print(f"Using SSH key: {args.ssh_key}")
-    print(f"Using SSH user/port: {args.ssh_user}/{args.ssh_port}")
-    print(f"Using max parallel SSH collections: {max_parallel}")
+    hub.logger.write(f"START journal_split_multi chargers={len(chargers)}")
+    hub.logger.write(f"ssh user={args.ssh_user} port={args.ssh_port} key={args.ssh_key}")
+    hub.logger.write(f"max_parallel={max_parallel}")
+    hub.logger.write(f"window since={args.since or '-'} until={args.until or '-'}")
 
-    if args.since or args.until:
-        print(f"Using journal window: since={args.since or '-'} until={args.until or '-'}")
-
-    await asyncio.gather(
+    return await asyncio.gather(
         *(
             process_charger_with_limit(
                 semaphore=semaphore,
@@ -622,12 +838,250 @@ async def async_main() -> None:
                 total=len(chargers),
                 charger=charger,
                 args=args,
+                hub=hub,
             )
             for index, charger in enumerate(chargers, start=1)
         )
     )
 
+
+def print_startup(chargers: list[Charger], args: argparse.Namespace, logger: EventLogger) -> None:
+    """Print plain-mode startup details."""
+    max_parallel = resolve_max_parallel(args.max_parallel, len(chargers))
+
+    print(f"Loaded {len(chargers)} charger(s) from {args.chargers_file}")
+    print(f"Using SSH key: {args.ssh_key}")
+    print(f"Using SSH user/port: {args.ssh_user}/{args.ssh_port}")
+    print(f"Using max parallel SSH collections: {max_parallel}")
+
+    if logger.path is not None:
+        print(f"Writing log file: {logger.path}")
+
+    if args.since or args.until:
+        print(f"Using journal window: since={args.since or '-'} until={args.until or '-'}")
+
+
+async def run_plain(args: argparse.Namespace, chargers: list[Charger], logger: EventLogger) -> None:
+    """Run the current terminal-oriented mode."""
+    print_startup(chargers, args, logger)
+    hub = EventHub(logger, console=True, progress=args.progress)
+    results = await run_collection(chargers, args, hub)
+    ok_count = sum(1 for result in results if result.ok)
+    failed_count = len(results) - ok_count
+    logger.write(f"END journal_split_multi ok={ok_count} failed={failed_count}")
+    print(f"\nDone. ok={ok_count} failed={failed_count}")
+
+
+async def run_local(args: argparse.Namespace, logger: EventLogger) -> None:
+    """Run local journal mode."""
+    print("Reading local journal (this may take a moment)...")
+
+    if logger.path is not None:
+        print(f"Writing log file: {logger.path}")
+
+    if args.since or args.until:
+        print(f"Journal window: since={args.since or '-'} until={args.until or '-'}")
+
+    logger.write("START local journal_split")
+    lines = run_local_journal(since=args.since, until=args.until)
+    stats = JournalReadStats(raw_lines=len(lines), matching_lines=len(lines), elapsed_s=0.0)
+    charger = Charger("local", "localhost")
+    hub = EventHub(logger, console=True, progress=args.progress)
+    await process_lines(lines, "local", charger, hub, stats)
+    logger.write("END local journal_split")
     print("\nDone.")
+
+
+if App is not None:
+
+    class JournalSplitTextualApp(App):  # type: ignore[misc]
+        """Textual interface with one progress/status row per charger."""
+
+        CSS = """
+        #header {
+            height: 3;
+            padding: 1;
+            background: $boost;
+        }
+
+        #summary {
+            height: 1;
+            padding-left: 1;
+        }
+
+        DataTable {
+            height: 1fr;
+        }
+        """
+
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+        ]
+
+        def __init__(
+            self,
+            chargers: list[Charger],
+            args: argparse.Namespace,
+            logger: EventLogger,
+        ) -> None:
+            super().__init__()
+            self.chargers = chargers
+            self.args = args
+            self.logger = logger
+            self.queue: asyncio.Queue[ChargerEvent] = asyncio.Queue()
+            self.results: list[ProcessResult] = []
+            self.done_count = 0
+            self.failed_count = 0
+
+        def compose(self) -> ComposeResult:
+            log_text = str(self.logger.path) if self.logger.path else "disabled"
+            yield Static(
+                f"Journal Split Multi\n"
+                f"chargers={len(self.chargers)}  "
+                f"max_parallel={resolve_max_parallel(self.args.max_parallel, len(self.chargers))}  "
+                f"log={log_text}",
+                id="header",
+            )
+            yield DataTable()
+            yield Static("pending", id="summary")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.table = self.query_one(DataTable)
+            self.summary = self.query_one("#summary", Static)
+            self.table.cursor_type = None
+            self.table.zebra_stripes = True
+
+            columns = [
+                ("ID", "id", 14),
+                ("IP", "ip", 13),
+                ("Status", "status", 12),
+                ("Raw", "raw", 10),
+                ("Matching", "matching", 10),
+                ("Sessions", "sessions", 8),
+                ("Files", "files", 6),
+                ("Elapsed", "elapsed", 9),
+                ("Message", "message", 60),
+            ]
+
+            for label, key, width in columns:
+                self.table.add_column(label, key=key, width=width)
+
+            for charger in self.chargers:
+                self.table.add_row(
+                    charger.custom_id,
+                    charger.ip,
+                    "pending",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "00:00:00",
+                    "",
+                    key=charger.custom_id,
+                )
+
+            self.run_worker(self.run_textual_collection(), exclusive=True)
+
+        async def run_textual_collection(self) -> None:
+            hub = EventHub(
+                self.logger,
+                console=False,
+                progress=self.args.progress,
+                queue=self.queue,
+            )
+
+            collection_task = asyncio.create_task(run_collection(self.chargers, self.args, hub))
+
+            while True:
+                if collection_task.done() and self.queue.empty():
+                    break
+
+                try:
+                    event = await asyncio.wait_for(self.queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+
+                self.apply_event(event)
+
+            self.results = await collection_task
+            ok_count = sum(1 for result in self.results if result.ok)
+            self.failed_count = len(self.results) - ok_count
+            self.done_count = ok_count
+            self.logger.write(f"END journal_split_multi ok={ok_count} failed={self.failed_count}")
+            self.update_summary(final=True)
+
+        def apply_event(self, event: ChargerEvent) -> None:
+            self.table.update_cell(event.custom_id, "status", event.status)
+            self.table.update_cell(event.custom_id, "raw", str(event.raw_lines))
+            self.table.update_cell(event.custom_id, "matching", str(event.matching_lines))
+            self.table.update_cell(event.custom_id, "sessions", str(event.sessions))
+            self.table.update_cell(event.custom_id, "files", str(event.files))
+            self.table.update_cell(event.custom_id, "elapsed", format_elapsed(event.elapsed_s))
+            self.table.update_cell(event.custom_id, "message", event.message[:60])
+
+            self.update_summary()
+
+        def update_summary(self, final: bool = False) -> None:
+            statuses = {
+                str(self.table.get_cell(charger.custom_id, "status"))
+                for charger in self.chargers
+            }
+
+            done = sum(
+                1
+                for charger in self.chargers
+                if self.table.get_cell(charger.custom_id, "status") == "done"
+            )
+            failed = sum(
+                1
+                for charger in self.chargers
+                if self.table.get_cell(charger.custom_id, "status") == "failed"
+            )
+            running = len(self.chargers) - done - failed
+
+            prefix = "finished" if final else "running"
+            self.summary.update(
+                f"{prefix}: running={running} done={done} failed={failed} "
+                f"statuses={', '.join(sorted(statuses))}"
+            )
+
+
+async def async_main() -> None:
+    """Async entry point."""
+    args = parse_args()
+    logger = make_logger(args)
+
+    try:
+        if args.local:
+            await run_local(args, logger)
+            return
+
+        chargers_path = Path(args.chargers_file)
+
+        try:
+            chargers = load_chargers(chargers_path)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.textual:
+            if App is None:
+                print(
+                    "Error: Textual is not installed. Install it with: python3 -m pip install textual",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            assert JournalSplitTextualApp is not None
+            app = JournalSplitTextualApp(chargers, args, logger)
+            app.run()
+            return
+
+        await run_plain(args, chargers, logger)
+
+    finally:
+        logger.close()
 
 
 def main() -> None:
