@@ -17,9 +17,6 @@ Multi-charger behavior:
         "politécnico", 10.53.1.21
         "outro carregador", 10.53.1.22
 
-  - For each charger, the script connects through SSH and runs:
-        journalctl -u chargepoint.service
-
 SSH behavior follows the working pattern from themall6_Claude.py:
   - asyncssh
   - default user: admin
@@ -27,9 +24,9 @@ SSH behavior follows the working pattern from themall6_Claude.py:
   - default key: ~/.ssh/id_ed25519_cp
   - known_hosts=None
 
-Datetime format in filenames: 2026-05-06_14-49-36
-  - Source: field 29 (1-indexed) of each filtered line
-  - Milliseconds are stripped
+Progress behavior:
+  - --since and --until limit the journalctl time window.
+  - --progress streams stdout and periodically reports raw/matching line counts.
 """
 
 from __future__ import annotations
@@ -38,39 +35,30 @@ import argparse
 import asyncio
 import csv
 import re
+import shlex
 import subprocess
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 try:
     import asyncssh  # type: ignore
-except ImportError:  # pragma: no cover - user-facing dependency check
+except ImportError:
     asyncssh = None  # type: ignore
 
-
-# --------------------------------------------------------------------------- #
-# Constants
-# --------------------------------------------------------------------------- #
 
 CHARGERS_FILE = "carregadores.dsv"
 DEFAULT_SSH_USER = "admin"
 DEFAULT_SSH_PORT = 5022
 DEFAULT_SSH_KEY = Path.home() / ".ssh" / "id_ed25519_cp"
+DEFAULT_PROGRESS_INTERVAL_S = 2.0
 
 GREP_PATTERN = re.compile(r"04 64 (?!10|11|e1)[0-9a-f]{2}.*")
-
-# field index 2 (0-indexed) -> session type
 START_BYTES = {"81": "chademo", "32": "ccs"}
-
-# session type -> its closing byte
 END_BYTES = {"chademo": "ad", "ccs": "22"}
 
-
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
 class Charger:
@@ -78,21 +66,15 @@ class Charger:
     ip: str
 
 
-# --------------------------------------------------------------------------- #
-# Charger list parsing
-# --------------------------------------------------------------------------- #
+@dataclass
+class JournalReadStats:
+    raw_lines: int = 0
+    matching_lines: int = 0
+    elapsed_s: float = 0.0
+
 
 def load_chargers(path: Path) -> list[Charger]:
-    """
-    Load chargers from a DSV/CSV-like file.
-
-    Expected rows:
-        custom_id, ip
-        "politécnico", 10.53.1.21
-
-    The first row is treated as a header if it contains custom_id and ip.
-    Empty lines and lines starting with # are ignored.
-    """
+    """Load chargers from a CSV/DSV-like file with columns custom_id, ip."""
     if not path.exists():
         raise FileNotFoundError(
             f"Charger list file not found: {path}\n"
@@ -116,7 +98,6 @@ def load_chargers(path: Path) -> list[Charger]:
 
     first = [cell.strip().lower() for cell in rows[0]]
     has_header = len(first) >= 2 and first[0] == "custom_id" and first[1] == "ip"
-
     data_rows = rows[1:] if has_header else rows
 
     chargers: list[Charger] = []
@@ -145,42 +126,79 @@ def load_chargers(path: Path) -> list[Charger]:
 
 
 def safe_filename_part(text: str) -> str:
-    """
-    Convert custom_id to a filesystem-safe prefix while preserving readability.
-
-    Examples:
-        politécnico -> politecnico
-        CP 001 / Teste -> CP_001_Teste
-    """
+    """Convert custom_id to a filesystem-safe prefix."""
     normalized = unicodedata.normalize("NFKD", text)
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_text).strip("._-")
     return safe or "charger"
 
 
-# --------------------------------------------------------------------------- #
-# Journal collection
-# --------------------------------------------------------------------------- #
+def build_journalctl_command(since: str | None = None, until: str | None = None) -> str:
+    """Build a shell-safe remote journalctl command."""
+    parts = ["journalctl", "-u", "chargepoint.service", "--no-pager"]
+
+    if since:
+        parts.extend(["--since", shlex.quote(since)])
+
+    if until:
+        parts.extend(["--until", shlex.quote(until)])
+
+    return " ".join(parts)
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as HH:MM:SS."""
+    total = int(seconds)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def maybe_print_progress(
+    label: str,
+    stats: JournalReadStats,
+    last_print_time: float,
+    interval_s: float,
+    force: bool = False,
+) -> float:
+    """Print progress periodically and return the updated last_print_time."""
+    now = time.monotonic()
+
+    if not force and (now - last_print_time) < interval_s:
+        return last_print_time
+
+    print(
+        f"[{label}] raw={stats.raw_lines} "
+        f"matching={stats.matching_lines} "
+        f"elapsed={format_elapsed(stats.elapsed_s)}",
+        flush=True,
+    )
+    return now
+
+
+def filter_one_journal_line(raw: str) -> str | None:
+    """Return the matching payload portion of a journal line, or None."""
+    m = GREP_PATTERN.search(raw)
+    return m.group(0) if m else None
+
 
 def filter_journal_output(stdout: str) -> list[str]:
     """Return only the payload portion matching GREP_PATTERN from journal output."""
     lines: list[str] = []
 
     for raw in stdout.splitlines():
-        m = GREP_PATTERN.search(raw)
-        if m:
-            lines.append(m.group(0))
+        matched = filter_one_journal_line(raw)
+        if matched:
+            lines.append(matched)
 
     return lines
 
 
-def run_local_journal() -> list[str]:
+def run_local_journal(since: str | None = None, until: str | None = None) -> list[str]:
     """Run local journalctl and return filtered lines."""
-    result = subprocess.run(
-        ["journalctl", "-u", "chargepoint.service"],
-        capture_output=True,
-        text=True,
-    )
+    command = build_journalctl_command(since=since, until=until)
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
     return filter_journal_output(result.stdout)
 
 
@@ -191,14 +209,15 @@ async def run_remote_journal(
     ssh_key: Path,
     connect_timeout: int,
     command_timeout: int,
+    since: str | None,
+    until: str | None,
+    progress: bool,
+    progress_interval_s: float,
 ) -> list[str]:
     """
     Run journalctl remotely over SSH using asyncssh and return filtered lines.
 
-    This intentionally mirrors themall6_Claude.py:
-    - explicit client key
-    - known_hosts=None
-    - no dependency on ssh-agent behavior
+    With --progress, stdout is streamed and raw/matching line counters are printed.
     """
     if asyncssh is None:
         print(
@@ -211,6 +230,12 @@ async def run_remote_journal(
         print(f"[{charger.custom_id}] SSH key not found: {ssh_key}", file=sys.stderr)
         return []
 
+    command = build_journalctl_command(since=since, until=until)
+    lines: list[str] = []
+    stats = JournalReadStats()
+    start_time = time.monotonic()
+    last_print_time = start_time
+
     try:
         conn = await asyncssh.connect(
             charger.ip,
@@ -222,10 +247,49 @@ async def run_remote_journal(
         )
 
         try:
-            result = await asyncio.wait_for(
-                conn.run("journalctl -u chargepoint.service", check=False),
-                timeout=command_timeout,
-            )
+            if progress:
+                print(f"[{charger.custom_id}] Running: {command}", flush=True)
+
+            process = await conn.create_process(command)
+
+            async def consume_stdout() -> None:
+                nonlocal last_print_time
+
+                async for raw_line in process.stdout:
+                    stats.raw_lines += 1
+                    matched = filter_one_journal_line(raw_line)
+
+                    if matched:
+                        lines.append(matched)
+                        stats.matching_lines += 1
+
+                    stats.elapsed_s = time.monotonic() - start_time
+
+                    if progress:
+                        last_print_time = maybe_print_progress(
+                            charger.custom_id,
+                            stats,
+                            last_print_time,
+                            progress_interval_s,
+                        )
+
+            await asyncio.wait_for(consume_stdout(), timeout=command_timeout)
+            await asyncio.wait_for(process.wait(), timeout=10)
+
+            if process.exit_status != 0:
+                stderr = ""
+
+                if process.stderr is not None:
+                    stderr = await process.stderr.read()
+
+                print(
+                    f"[{charger.custom_id}] journal command failed "
+                    f"(exit status {process.exit_status})\n"
+                    f"stderr: {stderr.strip()}",
+                    file=sys.stderr,
+                )
+                return []
+
         finally:
             conn.close()
             await conn.wait_closed()
@@ -241,34 +305,26 @@ async def run_remote_journal(
         print(f"[{charger.custom_id}] SSH connection failed: {exc}", file=sys.stderr)
         return []
 
-    if result.exit_status != 0:
-        error_text = result.stderr.strip() or result.stdout.strip()
-        print(
-            f"[{charger.custom_id}] journal command failed "
-            f"(exit status {result.exit_status})\n"
-            f"stderr/stdout: {error_text}",
-            file=sys.stderr,
+    stats.elapsed_s = time.monotonic() - start_time
+
+    if progress:
+        maybe_print_progress(
+            charger.custom_id,
+            stats,
+            last_print_time,
+            progress_interval_s,
+            force=True,
         )
-        return []
 
-    return filter_journal_output(result.stdout)
+    return lines
 
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 
 def get_dt(line: str) -> str:
-    """
-    Extract datetime from field 29 (index 28).
-
-    Input  : '... 2026-05-06T14:49:36.160 ...'
-    Output : '2026-05-06_14-49-36'
-    """
+    """Extract datetime from field 29 (index 28)."""
     fields = line.split()
 
     if len(fields) > 28:
-        dt_str = fields[28].split(".")[0]          # strip milliseconds
+        dt_str = fields[28].split(".")[0]
         return dt_str.replace("T", "_").replace(":", "-")
 
     return "unknown"
@@ -281,12 +337,7 @@ def get_byte(line: str) -> str | None:
 
 
 def save_file(lines: list[str], start_dt: str, end_dt: str, suffix: str, prefix: str = "") -> None:
-    """
-    Save lines to a log file.
-
-    If prefix is provided, filename becomes:
-        <prefix>_<start>_<end>_<suffix>.log
-    """
+    """Save lines to a log file."""
     clean_prefix = safe_filename_part(prefix) if prefix else ""
 
     if clean_prefix:
@@ -298,23 +349,8 @@ def save_file(lines: list[str], start_dt: str, end_dt: str, suffix: str, prefix:
     print(f"  Saved: {filename}  ({len(lines)} lines)")
 
 
-# --------------------------------------------------------------------------- #
-# Session detection
-# --------------------------------------------------------------------------- #
-
 def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
-    """
-    Scan lines and group them into charging sessions.
-
-    Rules:
-    - A session opens on the first occurrence of its start byte (81 / 32).
-    - A session closes (and a new one of the same type opens) when the start
-      byte reappears after the session's own end byte (ad / 22).
-    - A session closes immediately when the start byte of the OTHER type is seen.
-    - All lines between open and close belong to the session.
-
-    Returns a list of (session_type, start_dt, end_dt, lines) tuples.
-    """
+    """Scan lines and group them into charging sessions."""
     sessions: list[tuple[str, str, str, list[str]]] = []
     current_session: str | None = None
     current_lines: list[str] = []
@@ -367,10 +403,6 @@ def detect_sessions(lines: list[str]) -> list[tuple[str, str, str, list[str]]]:
     return sessions
 
 
-# --------------------------------------------------------------------------- #
-# Processing
-# --------------------------------------------------------------------------- #
-
 def process_lines(lines: list[str], prefix: str = "") -> None:
     """Save full journal and detected session files for one charger/source."""
     if not lines:
@@ -390,14 +422,28 @@ def process_lines(lines: list[str], prefix: str = "") -> None:
 
 
 async def process_charger(
+    index: int,
+    total: int,
     charger: Charger,
     ssh_user: str,
     ssh_port: int,
     ssh_key: Path,
     connect_timeout: int,
     command_timeout: int,
+    since: str | None,
+    until: str | None,
+    progress: bool,
+    progress_interval_s: float,
 ) -> None:
-    print(f"\n[{charger.custom_id}] Reading journal from {charger.ip}:{ssh_port}...")
+    """Collect and process one charger."""
+    print(f"\n[{index}/{total}] {charger.custom_id}  Connecting to {charger.ip}:{ssh_port}...")
+
+    if since or until:
+        print(
+            f"[{index}/{total}] {charger.custom_id}  "
+            f"Journal window: since={since or '-'} until={until or '-'}"
+        )
+
     lines = await run_remote_journal(
         charger,
         ssh_user=ssh_user,
@@ -405,15 +451,18 @@ async def process_charger(
         ssh_key=ssh_key,
         connect_timeout=connect_timeout,
         command_timeout=command_timeout,
+        since=since,
+        until=until,
+        progress=progress,
+        progress_interval_s=progress_interval_s,
     )
+
+    print(f"[{index}/{total}] {charger.custom_id}  Processing...")
     process_lines(lines, prefix=charger.custom_id)
 
 
-# --------------------------------------------------------------------------- #
-# CLI / Main
-# --------------------------------------------------------------------------- #
-
 def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description=(
             "Extract chargepoint.service journal payloads and split charging sessions. "
@@ -421,64 +470,58 @@ def parse_args() -> argparse.Namespace:
         )
     )
 
+    parser.add_argument("--chargers-file", default=CHARGERS_FILE)
+    parser.add_argument("--ssh-user", default=DEFAULT_SSH_USER)
+    parser.add_argument("--ssh-port", type=int, default=DEFAULT_SSH_PORT)
+    parser.add_argument("--ssh-key", type=Path, default=DEFAULT_SSH_KEY)
+    parser.add_argument("--connect-timeout", type=int, default=3)
+    parser.add_argument("--command-timeout", type=int, default=180)
+
     parser.add_argument(
-        "--chargers-file",
-        default=CHARGERS_FILE,
-        help=f"Path to charger list file. Default: {CHARGERS_FILE}",
+        "--since",
+        default=None,
+        help='Limit journalctl with --since, e.g. "2 days ago" or "2026-05-01 00:00:00".',
     )
 
     parser.add_argument(
-        "--ssh-user",
-        default=DEFAULT_SSH_USER,
-        help=f"Remote SSH user. Default: {DEFAULT_SSH_USER}",
+        "--until",
+        default=None,
+        help='Limit journalctl with --until, e.g. "2026-05-02 00:00:00".',
     )
 
     parser.add_argument(
-        "--ssh-port",
-        type=int,
-        default=DEFAULT_SSH_PORT,
-        help=f"Remote SSH port. Default: {DEFAULT_SSH_PORT}",
+        "--progress",
+        action="store_true",
+        help="Stream remote journal output and print raw/matching line counters.",
     )
 
     parser.add_argument(
-        "--ssh-key",
-        type=Path,
-        default=DEFAULT_SSH_KEY,
-        help=f"SSH private key path. Default: {DEFAULT_SSH_KEY}",
-    )
-
-    parser.add_argument(
-        "--connect-timeout",
-        type=int,
-        default=3,
-        help="SSH connection timeout in seconds. Default: 3",
-    )
-
-    parser.add_argument(
-        "--command-timeout",
-        type=int,
-        default=180,
-        help="Remote journal command timeout in seconds. Default: 180",
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL_S,
+        help=f"Seconds between progress prints. Default: {DEFAULT_PROGRESS_INTERVAL_S}",
     )
 
     parser.add_argument(
         "--local",
         action="store_true",
-        help=(
-            "Run only against the local machine, preserving the old behavior. "
-            "In this mode carregadores.dsv is not used."
-        ),
+        help="Run only against the local machine. In this mode carregadores.dsv is not used.",
     )
 
     return parser.parse_args()
 
 
 async def async_main() -> None:
+    """Async entry point."""
     args = parse_args()
 
     if args.local:
         print("Reading local journal (this may take a moment)...")
-        lines = run_local_journal()
+
+        if args.since or args.until:
+            print(f"Journal window: since={args.since or '-'} until={args.until or '-'}")
+
+        lines = run_local_journal(since=args.since, until=args.until)
         process_lines(lines)
         print("\nDone.")
         return
@@ -495,20 +538,30 @@ async def async_main() -> None:
     print(f"Using SSH key: {args.ssh_key}")
     print(f"Using SSH user/port: {args.ssh_user}/{args.ssh_port}")
 
-    for charger in chargers:
+    if args.since or args.until:
+        print(f"Using journal window: since={args.since or '-'} until={args.until or '-'}")
+
+    for index, charger in enumerate(chargers, start=1):
         await process_charger(
-            charger,
+            index=index,
+            total=len(chargers),
+            charger=charger,
             ssh_user=args.ssh_user,
             ssh_port=args.ssh_port,
             ssh_key=args.ssh_key,
             connect_timeout=args.connect_timeout,
             command_timeout=args.command_timeout,
+            since=args.since,
+            until=args.until,
+            progress=args.progress,
+            progress_interval_s=args.progress_interval,
         )
 
     print("\nDone.")
 
 
 def main() -> None:
+    """Program entry point."""
     asyncio.run(async_main())
 
 
