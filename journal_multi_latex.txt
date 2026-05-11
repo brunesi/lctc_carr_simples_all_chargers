@@ -1,0 +1,231 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[portuguese]{babel}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{tikz}
+\usepackage{tcolorbox}
+
+\usetikzlibrary{shapes.geometric, arrows, positioning, shadows, calc}
+
+\geometry{margin=2.5cm}
+
+% --- Configurações de Cores e Código ---
+\definecolor{darkgreen}{rgb}{0,0.4,0}
+\definecolor{darkblue}{rgb}{0,0,0.5}
+\definecolor{backgrey}{rgb}{0.97,0.97,0.97}
+
+\lstset{
+    language=Python,
+    backgroundcolor=\color{backgrey},
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{darkgreen},
+    commentstyle=\color{gray}\itshape,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    breaklines=true,
+    frame=single,
+    showstringspaces=false,
+    tabsize=4
+}
+
+% --- Estilos de Diagrama TikZ ---
+\tikzstyle{startstop} = [rectangle, rounded corners, minimum width=3.5cm, minimum height=1.2cm, text centered, draw=black, fill=red!20, font=\bfseries]
+\tikzstyle{process} = [rectangle, minimum width=3.5cm, minimum height=1.2cm, text centered, draw=black, fill=blue!10, font=\small]
+\tikzstyle{decision} = [diamond, aspect=2, minimum width=3.5cm, minimum height=1cm, text centered, draw=black, fill=green!10, font=\small]
+\tikzstyle{arrow} = [thick, ->, >=stealth]
+
+\title{
+    \textbf{\Huge Documentação Técnica}\\
+    \vspace{0.5cm}
+    \large Sistema Multi-Carregador de Extração de Logs (LCTC)\\
+    \vspace{1cm}
+    \texttt{journal\_strip\_multi\_chargers.py}
+}
+\author{Desenvolvido por Brunesi}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+\chapter{Visão Geral do Sistema}
+
+\section{Objetivo}
+O \texttt{journal\_strip\_multi\_chargers.py} é uma ferramenta de engenharia avançada projetada para realizar a coleta massiva e análise de logs em infraestruturas de carregamento de veículos elétricos (EV). O foco principal é extrair payloads hexadecimais do serviço \texttt{chargepoint.service}, permitindo a reconstrução de sessões de carregamento nos protocolos \textbf{CHAdeMO} e \textbf{CCS}.
+
+\section{Arquitetura de Software}
+O script utiliza o paradigma de \textbf{Programação Assíncrona} através da biblioteca \texttt{asyncio}. Diferente de modelos multi-thread tradicionais que consomem muita memória, este modelo permite gerenciar centenas de conexões SSH simultâneas em um único loop de eventos, aguardando I/O sem bloquear o processamento principal.
+
+\chapter{Estruturas de Dados e Classes}
+
+\section{Dataclasses de Estado}
+O código utiliza \texttt{dataclasses} para garantir imutabilidade e tipagem forte:
+
+\begin{itemize}
+    \item \textbf{\texttt{Charger}}: Armazena a identidade do hardware (\texttt{custom\_id} e \texttt{ip}).
+    \item \textbf{\texttt{JournalReadStats}}: Contador volátil para monitoramento de linhas brutas vs. linhas filtradas.
+    \item \textbf{\texttt{ChargerEvent}}: Objeto de transporte que notifica a interface sobre mudanças de estado (ex: "conectando", "salvando").
+    \item \textbf{\texttt{ProcessResult}}: Resumo final da operação de um carregador individual.
+\end{itemize}
+
+\section{Gerenciamento de Logs (\texttt{EventLogger})}
+A classe \texttt{EventLogger} é responsável pela persistência do histórico da aplicação. 
+\begin{itemize}
+    \item \textbf{Método \texttt{write}}: Adiciona timestamps e formata mensagens.
+    \item \textbf{Segurança}: Utiliza \texttt{flush()} imediato para garantir que em caso de crash do script, os logs até aquele ponto não sejam perdidos no buffer do SO.
+\end{itemize}
+
+\section{O Hub de Eventos (\texttt{EventHub})}
+Atua como um \textit{Broker} de mensagens interno. Quando uma corrotina de processamento de carregador detecta um progresso, ela emite um \texttt{ChargerEvent} para o Hub. O Hub então distribui essa informação para três destinos:
+\begin{enumerate}
+    \item O arquivo de log físico (via \texttt{EventLogger}).
+    \item O console padrão (Stdout), se o modo silencioso estiver desligado.
+    \item A fila assíncrona da interface \textit{Textual}, se a TUI estiver ativa.
+\end{enumerate}
+
+\chapter{Lógica de Processamento e Protocolos}
+
+\section{Filtragem de Dados (Regex)}
+O script busca o padrão \texttt{04 64 <byte>}. Este padrão é específico para as tramas de comunicação serial capturadas no journal do sistema Linux do carregador.
+A expressão regular \texttt{re.compile(r"04 64 (?!10|11|e1)[0-9a-f]\{2\}.*")} exclui explicitamente bytes de controle não desejados (\texttt{10, 11, e1}).
+
+\section{Detecção de Sessões}
+A função \texttt{detect\_sessions} implementa uma máquina de estados finitos (FSM) simplificada:
+
+\begin{center}
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|l|}
+\hline
+\textbf{Protocolo} & \textbf{Byte Start} & \textbf{Byte End} & \textbf{Ação} \\ \hline
+\textbf{CHAdeMO}   & \texttt{81}         & \texttt{ad}       & Fecha log anterior, inicia .chademo.log \\ \hline
+\textbf{CCS}       & \texttt{32}         & \texttt{22}       & Fecha log anterior, inicia .ccs.log \\ \hline
+\end{tabular}
+\caption{Gatilhos hexadecimais para segmentação de arquivos.}
+\end{table}
+\end{center}
+
+\chapter{Fluxo de Execução e Diagramas}
+
+\section{Diagrama de Fluxo Lógico}
+O diagrama abaixo detalha o caminho desde a leitura do DSV até a finalização das tarefas.
+
+\begin{center}
+\begin{tikzpicture}[node distance=1.8cm, auto]
+    % Nodes
+    \node (start) [startstop] {Início};
+    \node (parse) [process, below of=start] {Parse \texttt{carregadores.dsv}};
+    \node (sem) [process, below of=parse] {Init Semaphore (\texttt{max\_parallel})};
+    \node (loop) [process, below of=sem] {Lançar Corrotinas (Async)};
+    
+    \node (ssh) [process, left of=loop, xshift=-4cm] {SSH Connect};
+    \node (stream) [process, below of=ssh] {Stream \texttt{journalctl}};
+    \node (match) [decision, below of=stream, yshift=-1cm] {Match Regex?};
+    \node (save) [process, right of=match, xshift=3cm] {Buffer Linha};
+    
+    \node (endssh) [process, below of=match, yshift=-1.5cm] {Fim do Stream / Close SSH};
+    \node (split) [process, below of=endssh] {Split Sessões (Byte Logic)};
+    \node (disk) [startstop, below of=split] {Escrita em Disco (.log)};
+
+    % Lines
+    \draw [arrow] (start) -- (parse);
+    \draw [arrow] (parse) -- (sem);
+    \draw [arrow] (sem) -- (loop);
+    \draw [arrow] (loop) -| (ssh);
+    \draw [arrow] (ssh) -- (stream);
+    \draw [arrow] (stream) -- (match);
+    \draw [arrow] (match) -- node[anchor=south] {Sim} (save);
+    \draw [arrow] (save) |- (stream);
+    \draw [arrow] (match) -- node[anchor=west] {Não/EOF} (endssh);
+    \draw [arrow] (endssh) -- (split);
+    \draw [arrow] (split) -- (disk);
+    
+    % Boundary
+    \draw [dashed] ($(ssh.north west)+(-0.5,0.5)$) rectangle ($(disk.south east)+(0.5,-0.5)$);
+    \node at ($(ssh.north west)+(-0.5,0.8)$) [anchor=west] {Execução Paralela por Carregador};
+\end{tikzpicture}
+\end{center}
+
+\newpage
+\section{Controle de Concorrência (Semaforização)}
+Diferente de disparar todos os carregadores de uma vez, o uso de \texttt{asyncio.Semaphore(max\_parallel)} garante que o host não sofra exaustão de descritores de arquivo ou banda de rede.
+
+\begin{center}
+\begin{tikzpicture}[
+    block/.style={rectangle, draw, fill=blue!10, text width=2.5cm, text centered, minimum height=1cm},
+    gate/.style={trapezium, draw, fill=yellow!20, trapezium left angle=60, trapezium right angle=120, text width=1.5cm, text centered}
+]
+    \node (q) at (0,0) [block] {Fila de Carregadores (N)};
+    \node (g) at (5,0) [gate] {Semafor (Max=5)};
+    \node (e1) at (10,1) [block, fill=green!10] {Ativo 1};
+    \node (e2) at (10,0) [block, fill=green!10] {Ativo 2};
+    \node (en) at (10,-1) [block, fill=green!10] {Ativo ...};
+
+    \draw [arrow] (q) -- (g);
+    \draw [arrow] (g) -- (e1);
+    \draw [arrow] (g) -- (e2);
+    \draw [arrow] (g) -- (en);
+\end{tikzpicture}
+\end{center}
+
+\chapter{Interface de Usuário (Textual TUI)}
+
+\section{Estrutura da TUI}
+O componente \texttt{JournalSplitTextualApp} herda de \texttt{textual.app.App}. Ele organiza a tela em três áreas:
+\begin{itemize}
+    \item \textbf{Header}: Título e estatísticas globais.
+    \item \textbf{DataTable}: Tabela dinâmica onde cada linha representa um carregador.
+    \item \textbf{Footer}: Atalhos de teclado (ex: 'Q' para sair).
+\end{itemize}
+
+\section{Exemplo de Saída Visual}
+Abaixo, uma representação gráfica da tabela gerada pelo código em tempo de execução:
+
+\begin{tcolorbox}[colback=black,colframe=gray!50!black,title=Textual TUI - Interface de Monitoramento]
+\color{white}\ttfamily
+Journal Split Multi | Chargers: 12 | Max Parallel: 5 \\
+\rule{\textwidth}{0.5pt} \\
+\begin{tabular}{lllllll}
+\textbf{ID} & \textbf{Status} & \textbf{Raw} & \textbf{Match} & \textbf{Sess.} & \textbf{Elapsed} & \textbf{Message} \\
+politecnico & reading & 4502 & 120 & 2 & 00:01:12 & Receiving logs... \\
+carreg\_02  & done    & 890  & 45  & 1 & 00:00:22 & Saved 2 file(s). \\
+totem\_sul  & connecting & 0 & 0   & 0 & 00:00:02 & port: 5022 \\
+lab\_teste  & failed  & 0    & 0   & 0 & 00:00:05 & Connection timeout \\
+\end{tabular}
+\vspace{4cm} \\
+\rule{\textwidth}{0.5pt} \\
+Q Quit \hfill running: 10 done: 1 failed: 1
+\end{tcolorbox}
+
+\chapter{Manual de Métodos Principais}
+
+\section{\texttt{load\_chargers(path)}}
+Lê o arquivo DSV. Realiza a limpeza de aspas e espaços. Crucialmente, invoca \texttt{validate\_unique\_custom\_ids} para evitar que dois carregadores tentem escrever no mesmo arquivo de saída, o que causaria corrupção de dados.
+
+\section{\texttt{run\_remote\_journal(...)}}
+Este é o núcleo da comunicação. 
+\begin{itemize}
+    \item Abre a conexão SSH.
+    \item Cria um processo remoto executando \texttt{journalctl}.
+    \item Usa um gerador assíncrono para ler linha a linha (\texttt{async for raw\_line in process.stdout}).
+    \item Atualiza estatísticas em tempo real para a TUI através do Hub.
+\end{itemize}
+
+\section{\texttt{save\_file(...)}}
+Garante que os nomes dos arquivos sejam seguros para o sistema de arquivos utilizando a função \texttt{safe\_filename\_part}, que remove caracteres especiais e normaliza acentos para ASCII.
+
+\end{document}
