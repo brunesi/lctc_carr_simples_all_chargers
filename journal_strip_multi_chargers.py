@@ -17,7 +17,7 @@ Multi-charger behavior:
         "politécnico", 10.53.1.21
         "outro carregador", 10.53.1.22
 
-SSH behavior follows the working pattern from themall6_Claude.py:
+SSH behavior:
   - asyncssh
   - default user: admin
   - default port: 5022
@@ -31,6 +31,9 @@ Progress/log/UI behavior:
         yyyy-mm-dd_hh-mm-ss_journal-split-multi.log
   - --textual opens a Textual table with one progress/status row per charger.
   - --no-log disables the log file.
+
+Important:
+  - Textual is run outside asyncio.run(), avoiding nested event loop errors.
 """
 
 from __future__ import annotations
@@ -368,7 +371,6 @@ async def run_remote_journal(
         return lines, stats, False, message
 
     command = build_journalctl_command(since=args.since, until=args.until)
-
     await hub.emit(ChargerEvent(charger.custom_id, charger.ip, "command", message=command))
 
     try:
@@ -930,8 +932,6 @@ if App is not None:
             self.logger = logger
             self.queue: asyncio.Queue[ChargerEvent] = asyncio.Queue()
             self.results: list[ProcessResult] = []
-            self.done_count = 0
-            self.failed_count = 0
 
         def compose(self) -> ComposeResult:
             log_text = str(self.logger.path) if self.logger.path else "disabled"
@@ -984,10 +984,13 @@ if App is not None:
             self.run_worker(self.run_textual_collection(), exclusive=True)
 
         async def run_textual_collection(self) -> None:
+            # Force progress events for the UI, even if user forgot --progress.
+            self.args.progress = True
+
             hub = EventHub(
                 self.logger,
                 console=False,
-                progress=self.args.progress,
+                progress=True,
                 queue=self.queue,
             )
 
@@ -1006,9 +1009,8 @@ if App is not None:
 
             self.results = await collection_task
             ok_count = sum(1 for result in self.results if result.ok)
-            self.failed_count = len(self.results) - ok_count
-            self.done_count = ok_count
-            self.logger.write(f"END journal_split_multi ok={ok_count} failed={self.failed_count}")
+            failed_count = len(self.results) - ok_count
+            self.logger.write(f"END journal_split_multi ok={ok_count} failed={failed_count}")
             self.update_summary(final=True)
 
         def apply_event(self, event: ChargerEvent) -> None:
@@ -1019,15 +1021,9 @@ if App is not None:
             self.table.update_cell(event.custom_id, "files", str(event.files))
             self.table.update_cell(event.custom_id, "elapsed", format_elapsed(event.elapsed_s))
             self.table.update_cell(event.custom_id, "message", event.message[:60])
-
             self.update_summary()
 
         def update_summary(self, final: bool = False) -> None:
-            statuses = {
-                str(self.table.get_cell(charger.custom_id, "status"))
-                for charger in self.chargers
-            }
-
             done = sum(
                 1
                 for charger in self.chargers
@@ -1042,51 +1038,59 @@ if App is not None:
 
             prefix = "finished" if final else "running"
             self.summary.update(
-                f"{prefix}: running={running} done={done} failed={failed} "
-                f"statuses={', '.join(sorted(statuses))}"
+                f"{prefix}: running={running} done={done} failed={failed}"
             )
 
 
-async def async_main() -> None:
-    """Async entry point."""
+async def async_cli_main(args: argparse.Namespace, logger: EventLogger) -> None:
+    """Async entry point only for non-Textual modes."""
+    if args.local:
+        await run_local(args, logger)
+        return
+
+    chargers = load_chargers(Path(args.chargers_file))
+    await run_plain(args, chargers, logger)
+
+
+def run_textual_sync(args: argparse.Namespace, logger: EventLogger) -> None:
+    """Run Textual outside asyncio.run(), avoiding nested event loop errors."""
+    if args.local:
+        print("Error: --textual is not supported with --local in this version.", file=sys.stderr)
+        sys.exit(1)
+
+    if App is None:
+        print(
+            "Error: Textual is not installed. Install it with: python3 -m pip install textual",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    chargers = load_chargers(Path(args.chargers_file))
+
+    assert JournalSplitTextualApp is not None
+    app = JournalSplitTextualApp(chargers, args, logger)
+    app.run()
+
+
+def main() -> None:
+    """Program entry point.
+
+    Textual is intentionally executed outside asyncio.run(). Textual's App.run()
+    creates and manages its own event loop.
+    """
     args = parse_args()
     logger = make_logger(args)
 
     try:
-        if args.local:
-            await run_local(args, logger)
-            return
-
-        chargers_path = Path(args.chargers_file)
-
-        try:
-            chargers = load_chargers(chargers_path)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-
         if args.textual:
-            if App is None:
-                print(
-                    "Error: Textual is not installed. Install it with: python3 -m pip install textual",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            assert JournalSplitTextualApp is not None
-            app = JournalSplitTextualApp(chargers, args, logger)
-            app.run()
-            return
-
-        await run_plain(args, chargers, logger)
-
+            run_textual_sync(args, logger)
+        else:
+            asyncio.run(async_cli_main(args, logger))
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     finally:
         logger.close()
-
-
-def main() -> None:
-    """Program entry point."""
-    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
